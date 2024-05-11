@@ -1,9 +1,10 @@
+use regex::Regex;
 use scraper::{selectable::Selectable, ElementRef, Html, Selector};
-use serde::de;
 
 #[derive(Debug, PartialEq)]
 pub struct PartData {
     pub price: f64,
+    pub shop_id: i64,
     pub id: String,
     pub href: String,
 }
@@ -13,29 +14,16 @@ pub struct PartWithDetails {
     pub name: String,
     pub description: String,
     pub price: f64,
+    pub stock: i32,
     pub other_ids: Vec<String>,
 }
 
-impl PartData {
-    fn get_their_id(&self) -> String {
-        self.href
-            .split("/")
-            .into_iter()
-            .filter(|el| el.parse::<i32>().is_ok())
-            .map(String::from)
-            .collect::<Vec<String>>()
-            .first()
-            .map(|s| s.clone())
-            .unwrap()
-    }
-}
 struct MySelectors {
     parts_selector: Selector,
     pt_num_selector: Selector,
     pt_num_a_selector: Selector,
     price_selector: Selector,
     p_selector: Selector,
-    text_ids_selector: Selector,
     other_ids_selector: Selector,
     name_selector: Selector,
 }
@@ -48,8 +36,6 @@ impl MySelectors {
             pt_num_a_selector: Selector::parse("div a").unwrap(),
             price_selector: Selector::parse(".col-lg-2.col-md-2.col-sm-3.col-xs-3").unwrap(),
             p_selector: Selector::parse("p").unwrap(),
-            text_ids_selector: Selector::parse(".col-md-12.col-sm-12.col-xs-12.text-left.styl_exo")
-                .unwrap(),
             other_ids_selector: Selector::parse(".opistresc").unwrap(),
             name_selector: Selector::parse(
                 ".col-lg-9.col-md-8.col-sm-7.col-xs-12.text-left.styl_exo",
@@ -90,9 +76,23 @@ pub fn get_parts_from_html(html: &Html) -> Vec<PartData> {
             let prices = get_prices(parts, &selectors);
 
             let parts_nums = get_ids(parts, &selectors);
-
+            let digit_regex = Regex::new(r"\/(\d+)\/").unwrap();
             Iterator::zip(prices.into_iter(), parts_nums)
-                .map(|(price, (href, id))| PartData { price, id, href })
+                .map(|(price, (href, id))| {
+                    let their_id = digit_regex
+                        .captures_iter(&href)
+                        .map(|m| m.extract())
+                        .map(|(_, [id_str])| id_str.parse::<i64>().unwrap())
+                        .last()
+                        .unwrap();
+
+                    PartData {
+                        price: price,
+                        id: id,
+                        shop_id: their_id,
+                        href: href,
+                    }
+                })
                 .collect::<Vec<PartData>>()
         })
         .collect()
@@ -114,7 +114,7 @@ pub fn get_part_details(html: &Html, parent: &PartData) -> PartWithDetails {
         .next()
         .unwrap_or("empty".to_string());
 
-    let descriptionWithOtherIds = html
+    let description_with_other_ids = html
         .select(&selectors.other_ids_selector)
         .flat_map(|p| {
             p.text()
@@ -126,18 +126,40 @@ pub fn get_part_details(html: &Html, parent: &PartData) -> PartWithDetails {
         .filter(|s| !s.trim().is_empty())
         .collect::<Vec<String>>();
 
-    let (descriptionArr, idsStr) =
-        descriptionWithOtherIds.split_at(descriptionWithOtherIds.len() - 1);
+    let b_selector = Selector::parse("b").unwrap();
+    let stock_regex = Regex::new(r"(\d+)").unwrap();
+    let stock: i32 = html
+        .select(&selectors.p_selector)
+        .filter(|div| div.value().attr("id") == Some("myDIV"))
+        .map(|e| e.select(&b_selector).next().unwrap())
+        .flat_map(|a| a.text().into_iter().map(String::from).collect::<Vec<_>>())
+        .flat_map(|str| {
+            stock_regex
+                .captures_iter(&str)
+                .map(|c| c.extract())
+                .map(|(_, [str])| str.to_string())
+                .map(|str| str.parse::<i32>().unwrap_or(0))
+                .collect::<Vec<i32>>()
+        })
+        .last()
+        .unwrap_or(0);
 
-    let description = descriptionArr
+    let (description_arr, ids_str) =
+        description_with_other_ids.split_at(description_with_other_ids.len() - 1);
+
+    let description = description_arr
         .into_iter()
         .map(|s| s.to_string())
         .collect::<Vec<String>>()
         .join("\n");
 
-    let ids = idsStr
+    let ids = ids_str
         .into_iter()
-        .flat_map(|s| s.split(",").map(|s| s.to_string()).collect::<Vec<String>>())
+        .flat_map(|s| {
+            s.split(",")
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<String>>()
+        })
         .collect::<Vec<String>>();
 
     PartWithDetails {
@@ -145,6 +167,7 @@ pub fn get_part_details(html: &Html, parent: &PartData) -> PartWithDetails {
         name: name,
         description: description,
         price: parent.price.clone(),
+        stock: stock,
         other_ids: ids,
     }
 }
@@ -223,6 +246,7 @@ mod tests {
         let parent = PartData {
             price: 1062.0,
             id: String::from("Z 600-105 DOR"),
+            shop_id: 0,
             href: String::from(
                 "https://www.jeepchryslerparts.pl/sklep/produkt/6493/aktywator-napedu.html",
             ),
@@ -231,7 +255,40 @@ mod tests {
 
         assert_eq!(
             result,
-            PartWithDetails{ id: String::from("Z 600-105 DOR"), name: String::from("AKTYWATOR NAPĘDU"), description: String::from("AKTYWATOR NAPĘDU 4WD/AWD\nFORD EXPEDITION 2003-2015\nFORD F-150 2004-2015\nLINCOLN MARK LT 2006-2008\nLINCOLN NAVIGATOR 2003-2015\nDORMAN"), price: 1062.0, other_ids: vec!["600-105".to_string(), " 7L1Z3C247A".to_string(), " TCA107".to_string()] }
+            PartWithDetails{ id: String::from("Z 600-105 DOR"), name: String::from("AKTYWATOR NAPĘDU"), description: String::from("AKTYWATOR NAPĘDU 4WD/AWD\nFORD EXPEDITION 2003-2015\nFORD F-150 2004-2015\nLINCOLN MARK LT 2006-2008\nLINCOLN NAVIGATOR 2003-2015\nDORMAN"), price: 1062.0, stock: 0, other_ids: vec!["600-105".to_string(), " 7L1Z3C247A".to_string(), " TCA107".to_string()] }
+        )
+    }
+
+    #[test]
+    fn shoud_parse_inner_html_with_stock() {
+        let path: String = [
+            env!("CARGO_MANIFEST_DIR"),
+            "resources",
+            "test",
+            "submit.html",
+        ]
+        .join("/");
+        let html_string = std::fs::read_to_string(path).expect("Error reading file");
+
+        let html: Html = Html::parse_document(&html_string);
+        let parent = PartData {
+            price: 1062.0,
+            id: String::from("Z 600-105 DOR"),
+            shop_id: 0,
+            href: String::from(
+                "https://www.jeepchryslerparts.pl/sklep/produkt/6493/aktywator-napedu.html",
+            ),
+        };
+        let result = get_part_details(&html, &parent);
+        println!("{:?}", result.other_ids);
+        assert_eq!(
+            result.other_ids,
+            vec![
+                "CA9471".to_string(),
+                "5015610AA".to_string(),
+                "WIX 42190".to_string(),
+                "AA3037".to_string()
+            ]
         )
     }
 
